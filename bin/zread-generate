@@ -1,0 +1,226 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+
+const args = parseArgs(process.argv.slice(2));
+const cwd = path.resolve(args.cwd || process.cwd());
+const maxRuns = positiveInt(args.maxRuns || process.env.ZREAD_MAX_RUNS, 5);
+const retryDelayMs = positiveInt(args.retryDelayMs || process.env.ZREAD_RETRY_DELAY_MS, 5000);
+const skipFailed = Boolean(args.skipFailed || process.env.ZREAD_SKIP_FAILED === '1');
+
+const wikiDir = path.join(cwd, '.zread', 'wiki');
+const draftsDir = path.join(wikiDir, 'drafts');
+const currentFile = path.join(wikiDir, 'current');
+
+if (args.help) {
+  printHelp();
+  process.exit(0);
+}
+
+if (args.extra.length > 0) {
+  fail(`unknown arguments: ${args.extra.join(' ')}`);
+}
+
+for (let run = 1; run <= maxRuns; run += 1) {
+  const result = await runZread(run);
+  const validation = validateWiki();
+
+  const finalPages = result.finalEvent?.vm?.pages;
+  const finalDone = result.finalEvent?.done === true;
+  const allPagesDone = finalPages?.total > 0 && finalPages.done === finalPages.total;
+
+  if (result.code === 0 && finalDone && allPagesDone && validation.ok) {
+    console.log(`[zread] complete: ${validation.pages} pages in ${validation.current}`);
+    process.exit(0);
+  }
+
+  console.error(
+    `[zread] incomplete run ${run}: exit=${result.code}, finalDone=${finalDone}, pages=${finalPages?.done ?? 0}/${finalPages?.total ?? 0}, validation=${validation.reason}`,
+  );
+
+  if (run < maxRuns) {
+    console.log(`[zread] retrying in ${retryDelayMs}ms; existing draft will be resumed if present`);
+    await sleep(retryDelayMs);
+  }
+}
+
+fail(`failed after ${maxRuns} runs`);
+
+function parseArgs(argv) {
+  const parsed = {
+    cwd: '',
+    maxRuns: '',
+    retryDelayMs: '',
+    skipFailed: false,
+    help: false,
+    extra: [],
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      parsed.help = true;
+    } else if (arg === '--cwd') {
+      parsed.cwd = requireValue(argv, ++i, arg);
+    } else if (arg === '--max-runs') {
+      parsed.maxRuns = requireValue(argv, ++i, arg);
+    } else if (arg === '--retry-delay-ms') {
+      parsed.retryDelayMs = requireValue(argv, ++i, arg);
+    } else if (arg === '--skip-failed') {
+      parsed.skipFailed = true;
+    } else {
+      parsed.extra.push(arg);
+    }
+  }
+
+  return parsed;
+}
+
+function requireValue(argv, index, flag) {
+  const value = argv[index];
+  if (!value || value.startsWith('--')) {
+    fail(`${flag} requires a value`);
+  }
+  return value;
+}
+
+function positiveInt(value, fallback) {
+  if (value === undefined || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    fail(`expected a positive integer, got ${value}`);
+  }
+  return parsed;
+}
+
+function validateWiki() {
+  if (!existsSync(currentFile)) {
+    return { ok: false, reason: '.zread/wiki/current does not exist' };
+  }
+
+  const current = readFileSync(currentFile, 'utf8').trim();
+  const wikiJsonPath = path.join(wikiDir, current, 'wiki.json');
+  if (!existsSync(wikiJsonPath)) {
+    return { ok: false, reason: `${wikiJsonPath} does not exist` };
+  }
+
+  const wiki = JSON.parse(readFileSync(wikiJsonPath, 'utf8'));
+  if (!Array.isArray(wiki.pages) || wiki.pages.length === 0) {
+    return { ok: false, reason: 'wiki.json has no pages' };
+  }
+
+  const missing = wiki.pages
+    .map((page) => page.file)
+    .filter((file) => !file || !existsSync(path.join(wikiDir, current, file)));
+
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing page files: ${missing.join(', ')}` };
+  }
+
+  if (existsSync(draftsDir)) {
+    return { ok: false, reason: '.zread/wiki/drafts still exists' };
+  }
+
+  return { ok: true, current, pages: wiki.pages.length };
+}
+
+async function runZread(runNumber) {
+  const zreadArgs = ['generate', '--stdio', '-y'];
+  if (existsSync(draftsDir)) {
+    zreadArgs.push('--draft', 'resume');
+  }
+  if (skipFailed) {
+    zreadArgs.push('--skip-failed');
+  }
+
+  console.log(`[zread] cwd: ${cwd}`);
+  console.log(`[zread] run ${runNumber}/${maxRuns}: zread ${zreadArgs.join(' ')}`);
+
+  return new Promise((resolve) => {
+    const child = spawn('zread', zreadArgs, {
+      cwd,
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+
+    let finalEvent = null;
+    let lastDone = -1;
+    let lastTotal = -1;
+    const requestedRetry = new Set();
+
+    const rl = readline.createInterface({ input: child.stdout });
+
+    rl.on('line', (line) => {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        console.log(line);
+        return;
+      }
+
+      finalEvent = event;
+
+      const pages = event.vm?.pages;
+      if (pages && (pages.done !== lastDone || pages.total !== lastTotal)) {
+        lastDone = pages.done;
+        lastTotal = pages.total;
+        console.log(`[zread] pages ${lastDone}/${lastTotal}`);
+      }
+
+      if (event.vm?.state === 'error' || event.error) {
+        console.error(`[zread] error: ${event.error || event.vm?.error || 'unknown error'}`);
+      }
+
+      if (pages?.waiting_retry && event.waiting_for?.includes('retry')) {
+        const failed = pages.tasks?.find((task) => task.state === 'failed');
+        if (failed && !requestedRetry.has(failed.id)) {
+          requestedRetry.add(failed.id);
+          child.stdin.write(`${JSON.stringify({ type: 'retry', params: { task_id: failed.id } })}\n`);
+          console.log(`[zread] retry page ${failed.id}: ${failed.slug}`);
+        } else if (skipFailed && event.waiting_for.includes('skip_all')) {
+          child.stdin.write(`${JSON.stringify({ type: 'skip_all', params: {} })}\n`);
+          console.log('[zread] skip failed pages after retry attempts');
+        }
+      }
+    });
+
+    child.on('error', (error) => {
+      console.error(`[zread] failed to start zread: ${error.message}`);
+      resolve({ code: 127, finalEvent });
+    });
+
+    child.on('close', (code) => {
+      resolve({ code, finalEvent });
+    });
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function printHelp() {
+  console.log(`Usage:
+  zread-generate [--cwd <repo>] [--max-runs <n>] [--retry-delay-ms <ms>] [--skip-failed]
+
+Options:
+  --cwd <repo>            Repository directory to document. Defaults to the current directory.
+  --max-runs <n>          Maximum process-level attempts. Defaults to 5.
+  --retry-delay-ms <ms>   Delay between process-level retries. Defaults to 5000.
+  --skip-failed           Pass --skip-failed to zread after page retries are exhausted.
+
+Environment:
+  ZREAD_MAX_RUNS
+  ZREAD_RETRY_DELAY_MS
+  ZREAD_SKIP_FAILED=1`);
+}
+
+function fail(message) {
+  console.error(`[zread] ${message}`);
+  process.exit(1);
+}
